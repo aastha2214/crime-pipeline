@@ -1,0 +1,178 @@
+# Whole stack on one machine: data DB, ETL pipeline (+ its Prefect scheduler), Metabase dashboard, optional pgAdmin.
+#
+# NETWORK EXPOSURE: every published port is bound to 127.0.0.1, so nothing is reachable from the internet,
+# EXCEPT the optional `caddy` service (profile "public"), which publishes 80/443 as a public HTTPS front door.
+# Reach the other web UIs through an SSH tunnel (see DEPLOY_CLOUD.md). Docker bypasses ufw for published ports, which is
+# why the binding is done here and not left to the firewall.
+
+x-logging: &default-logging # cap container logs so a small VM disk can't fill up
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres_cpd: # holds the crime data written by the ETL pipeline
+    image: postgres:16
+    container_name: postgres_cpd_dev
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: cpd_db
+    ports:
+      - "127.0.0.1:5433:5432" # host 5433 -> container 5432; localhost only
+    volumes:
+      - pgdata_cpd:/var/lib/postgresql/data
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - metanet1
+    healthcheck: # lets other services wait until Postgres actually accepts connections
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d cpd_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin: # optional DB browser. NOT started by default: `docker compose --profile admin up -d pgadmin`
+    image: dpage/pgadmin4
+    container_name: pgadmin_dev
+    profiles: ["admin"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "127.0.0.1:8081:80"
+    depends_on:
+      postgres_cpd:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - metanet1
+
+  postgres_mb: # Metabase's own application database (users, saved questions, dashboards)
+    image: postgres:16
+    container_name: postgres_metabase # Metabase reaches it by this name
+    hostname: postgres_metabase
+    environment:
+      POSTGRES_USER: ${METABASE_DB_USER}
+      POSTGRES_DB: metabaseappdb
+      POSTGRES_PASSWORD: ${METABASE_DB_PASSWORD}
+    volumes:
+      - pgdata_mb:/var/lib/postgresql/data
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - metanet1
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${METABASE_DB_USER} -d metabaseappdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  metabase: # https://www.metabase.com/docs/latest/installation-and-operation/running-metabase-on-docker
+    image: metabase/metabase:v0.65.2.5
+    container_name: metabase
+    hostname: metabase
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabaseappdb
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${METABASE_DB_USER}
+      MB_DB_PASS: ${METABASE_DB_PASSWORD}
+      MB_DB_HOST: postgres_metabase # must match the container name of postgres_mb
+    depends_on: # don't start Metabase until its app DB (and the data DB it will query) are ready
+      postgres_mb:
+        condition: service_healthy
+      postgres_cpd:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - metanet1
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail -I http://localhost:3000/api/health || exit 1"]
+      interval: 15s # a duration needs a unit; a bare 15 is invalid
+      timeout: 5s
+      retries: 5
+      start_period: 60s # Metabase takes a while to boot; don't count failures during that time
+
+  caddy: # OPTIONAL public HTTPS front door for Metabase. Start with: docker compose --profile public up -d caddy
+    image: caddy:2
+    container_name: caddy
+    profiles: ["public"]
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost} # set SITE_DOMAIN in .env, e.g. 3-24-232-21.sslip.io
+    ports: # the ONLY ports published to the whole internet (everything else stays on 127.0.0.1)
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # certificates: keep this volume or Caddy re-requests them on every start
+      - caddy_config:/config
+    depends_on:
+      metabase:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - metanet1 # reaches Metabase as metabase:3000 over the Docker network
+
+  prefect_server: # the scheduler. Without a server Prefect never triggers scheduled runs (it only serves the flow).
+    build: .
+    image: cpd-pipeline:latest
+    container_name: prefect_server
+    command: prefect server start --host 0.0.0.0 --port 4200
+    environment:
+      PREFECT_HOME: /app/.prefect
+    ports:
+      - "127.0.0.1:4200:4200" # Prefect API and its /docs page; localhost only. The web UI was NOT served on the AWS deployment (cause unknown)
+    volumes:
+      - prefect_data:/app/.prefect # run history survives restarts
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - metanet1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:4200/api/health', timeout=4)"]
+      interval: 15s
+      timeout: 6s
+      retries: 8
+      start_period: 30s
+
+  pipeline: # the ETL flow, served on its daily schedule: `python etl_pipeline.py`
+    build: .
+    image: cpd-pipeline:latest
+    container_name: cpd_pipeline
+    command: python etl_pipeline.py
+    env_file: .env # SOCRATA_APP_TOKEN, POSTGRES_USER/PASSWORD, METABASE_ADMIN_*, ...
+    environment: # these win over .env: inside Docker the hosts are service names, not localhost
+      POSTGRES_HOST: postgres_cpd
+      POSTGRES_PORT: "5432"
+      METABASE_URL: http://metabase:3000
+      METABASE_PUBLIC_URL: http://localhost:3000 # what to print: you reach Metabase through an SSH tunnel
+      PREFECT_API_URL: http://prefect_server:4200/api
+      PREFECT_HOME: /app/.prefect
+    depends_on:
+      postgres_cpd:
+        condition: service_healthy
+      prefect_server:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - metanet1
+
+# Separate volumes keep each database's files isolated and persistent across restarts.
+volumes:
+  pgdata_cpd:
+  pgdata_mb:
+  prefect_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  metanet1:
+    driver: bridge # services reach each other by service/container name

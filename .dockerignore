@@ -1,0 +1,13 @@
+# secrets and local state must never be baked into the image
+.env
+.env.*
+!.env.example
+.venv/
+.prefect/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.DS_Store
+*.ipynb
+*.zip

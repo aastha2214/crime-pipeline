@@ -1,0 +1,7 @@
+pandas==3.1.0
+prefect==3.9.1
+psycopg2-binary==2.9.13
+pytest==9.2.0
+python-dotenv==1.2.4
+requests==2.34.2
+sodapy==2.2.0

@@ -1,0 +1,27 @@
+# secrets: never commit these
+.env
+*.pem
+*.key
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# prefect local state (we point PREFECT_HOME at ./.prefect so nothing is written to ~)
+.prefect/
+
+# archives
+*.zip
+
+# project report and its build files (kept on the owner's computer only)
+PAI102_Final_Report.docx
+PAI102_Final_Report.pdf
+Dashboard_Explanation.pdf
+report_assets/
+charts/
+
+# OS / editor
+.DS_Store
+.idea/

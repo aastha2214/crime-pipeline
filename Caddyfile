@@ -1,0 +1,11 @@
+# Public HTTPS front door for Metabase (started only with `docker compose --profile public up -d caddy`).
+# {$SITE_DOMAIN} comes from .env, e.g. 3-24-232-21.sslip.io. Caddy gets and renews the TLS certificate by itself;
+# that needs ports 80 and 443 reachable from the internet (open them in the cloud firewall / security group).
+{$SITE_DOMAIN} {
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+	reverse_proxy metabase:3000
+}
